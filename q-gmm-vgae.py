@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric as pyg
+import numpy as np
+from tqdm import tqdm
+import random
+import os
+import scipy.sparse as sp
+from utils import *
+import argparse
+from models import GCN, GMMVariationalGCNEncoder, gmm_pretrain
+from sklearn.cluster import KMeans
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+data_dir = "./data"
+os.makedirs(data_dir, exist_ok=True)
+
+dataset_name = 'Cora'
+if 'dataset' in os.environ:
+	dataset_name = os.environ['dataset']
+
+def get_dataset(dataset_name):
+	if dataset_name in ['Cora', 'CiteSeer', 'PubMed']:
+		return pyg.datasets.Planetoid, dataset_name
+	if dataset_name in ['USA', 'Brazil', 'Europe']:
+		return pyg.datasets.Airports, dataset_name
+
+dataset_class, pyg_dataset_name = get_dataset(dataset_name)
+dataset = dataset_class(name=pyg_dataset_name, root=f'data/')
+data = dataset[0].to(device)
+# print('p:', dataset[0])
+
+edge_list = dataset[0].edge_index
+e = edge_list.shape[1]  # number of edges
+labels = dataset[0].y.to(device)
+edge_list = edge_list.to(device)
+# print("Homophilic ratio : " + str(pyg.utils.homophily(edge_list, labels, method='edge')))
+
+
+adj = pyg.utils.to_dense_adj(dataset[0].edge_index)
+adj = adj[0]
+# From Rethinking GAE paper
+adj_sp = sp.csr_matrix(adj.numpy())
+adj_sp = adj_sp - sp.dia_matrix((adj_sp.diagonal()[np.newaxis, :], [0]), shape=adj_sp.shape)
+adj_sp.eliminate_zeros()
+adj_norm = normalize_adj(adj_sp)
+adj_label = adj_sp + sp.eye(adj_sp.shape[0])
+adj_label = sparse_to_tuple(adj_label)
+adj_norm = torch.sparse.FloatTensor(torch.LongTensor(adj_norm[0].T), torch.FloatTensor(adj_norm[1]), torch.Size(adj_norm[2])).to(device)
+adj_label = torch.sparse.FloatTensor(torch.LongTensor(adj_label[0].T), torch.FloatTensor(adj_label[1]), torch.Size(adj_label[2])).to(device)
+
+pos_weight_orig = float(adj.shape[0] * adj.shape[0] - adj.sum()) / adj.sum()
+weight_mask_orig = adj_label.to_dense().view(-1) == 1
+weight_tensor_orig = torch.ones(weight_mask_orig.size(0), device=device)
+weight_tensor_orig[weight_mask_orig] = pos_weight_orig.to(device)
+
+norm = adj.shape[0] * adj.shape[0] / float((adj.shape[0] * adj.shape[0] - adj.sum()) * 2)
+
+
+X = dataset[0].x
+p = X.shape[0]  # Number of nodes
+
+# X = X.to_dense() remove this
+if dataset_name in ['USA', 'Brazil', 'Europe']:
+	degrees = adj.sum(dim=1).long()
+	features = torch.zeros(p, int(degrees.max())+1,device=device)
+	features[torch.arange(p),degrees] = 1
+	X = features
+	data.x = features
+	
+n = X.shape[1]  # feature dimension
+k = len(torch.unique(labels))  # Number of cluster and coarsened dimension
+
+sparsity_original = 2*e/(p*(p-1))
+# print("Sparsity of original graph : " + str(sparsity_original))
+
+
+# print('X:', X.shape, 'adj', adj.shape)
+
+nn = int(1*p)
+# X = X[:nn, :]
+# adj = adj[:nn, :nn]
+# labels = labels[:nn]
+
+theta = get_laplacian(adj)
+try:
+	theta = convertScipyToTensor(theta)
+except:
+	pass
+theta = theta.to(device)
+# print(f"theta: {theta.shape}")
+
+B = get_modularity_matrix(adj)  # B -> modularity matrix
+try:
+	B = convertScipyToTensor(B)
+except:
+	pass
+B = B.to(device)
+# print(f"B: {B.shape}")
+
+try:
+	X = convertScipyToTensor(X)
+	X = X.to_dense()
+except:
+	pass
+X = X.to(device)
+
+J = (torch.ones((k, k) ,device=device)/k)
+
+def main(args):
+	scaling = {
+		'Cora': 1e5,
+		'CiteSeer': 1e5,
+	}
+	if args.loss_scaler == -1:
+		if dataset_name in scaling:
+			args.loss_scaler = scaling[dataset_name]
+		else:
+			args.loss_scaler = 1e5
+
+	if args.random_seed is not None and args.random_seed != -1:
+		# random_seed = random.randint(0, 1e4)
+		torch.manual_seed(args.random_seed)
+		random.seed(args.random_seed)
+		np.random.seed(args.random_seed)
+		torch.cuda.manual_seed_all(args.random_seed)
+	
+	encoder = GMMVariationalGCNEncoder(n, 128, 64, k)
+	encoder.to(device)
+	model = pyg.nn.models.VGAE(encoder)
+	model.train()
+	model.to(device)
+
+	gmm_pretrain(model, adj_norm, X, adj_label, labels, weight_tensor_orig, norm, args.epochs, args.lr, dataset_name)
+
+	optimizer = torch.optim.Adam(params=model.parameters(), lr=args.lr)
+	if args.lr_sched == 'Plateau':
+		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', verbose=True)
+	if args.lr_sched == 'Step':
+		scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epochs//8, gamma=0.5, verbose=True)
+	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda= lambda e: 10 if e>0.1*args.epochs else 1)
+	metrics_time = []
+	losses_history = []
+
+	for epoch in (pbar := tqdm(range(args.epochs))):
+		optimizer.zero_grad()
+		Z_latent = model.encode(data.x, adj_norm) # [p, 64 (out_channels)]
+		C_soft = model.encoder.predict_soft(Z_latent) # [p, k]
+		kl_loss = model.kl_loss()
+
+		recon_loss = model.recon_loss(C_soft, data.edge_index)
+		
+		pred_clusters = C_soft.argmax(dim=1)
+		C = (C_soft == C_soft.max(dim=1)[0][:,None]).float()
+		
+		X_tilde = torch.linalg.pinv(C) @ X # dim of X_tilde: [k,n]
+
+		cluster_sizes = C.sum(axis=0)
+	
+		cluster_sizes_norm = torch.linalg.norm(cluster_sizes, ord=2) 
+		
+		coarsened_theta_term = -torch.logdet(C_soft.T@theta@C_soft + J)
+		coarsened_features_term = torch.trace(X_tilde.T@C_soft.T@theta@C_soft@X_tilde)
+		coarsening_constraint_term = (torch.norm(C_soft@X_tilde - X, p='fro')**2)/2
+		C_sparsity_term = (torch.norm(C_soft.T.norm(dim=1, p=1), p=2)**2)/2
+		modularity_term = -torch.trace(C_soft.T@B@C_soft)/(2*e)
+		collapse_reg_term = np.sqrt(k)/p*cluster_sizes_norm - 1
+
+		loss = (args.gamma*coarsened_theta_term + coarsened_features_term + args.alpha*coarsening_constraint_term + \
+				args.lambdap*C_sparsity_term + args.beta*modularity_term + args.delta*collapse_reg_term)/args.loss_scaler
+		loss = loss + args.kl_lambda*kl_loss + args.recon_lambda*recon_loss
+
+		loss.backward()
+		optimizer.step()
+
+		metrics = model_eval(adj.cpu(), pred_clusters.cpu(), labels.cpu())
+		metrics['loss'] = loss.cpu().detach()
+		metrics_time.append(metrics)
+
+		if args.lr_sched == 'Plateau':
+			scheduler.step(loss)
+		if args.lr_sched == 'Step':
+			scheduler.step()
+
+		# if args.umap and epoch%25==0:
+		# 	# import ipdb; ipdb.set_trace()
+		# 	fig_labels, fig_clusters, fig_X_tilde, fig_latent = embed_umap_plot(X, X_tilde, labels, pred_clusters, latent=Z_latent) 
+		# 	experiment.log_figure('GT Labels', fig_labels, step=epoch)
+		# 	experiment.log_figure('Clusters', fig_clusters, step=epoch)
+		# 	experiment.log_figure('Coarsened Graph', fig_X_tilde, step=epoch)
+		# 	experiment.log_figure('Latent Clusters', fig_latent, step=epoch)
+
+	params = {
+		'p': p,
+		'k': k,
+		'n': n,
+		'dataset': dataset_name
+	}
+	return params, metrics, metrics_time
+		
+
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--lr', type=float, default=1e-3, help="Learning Rate")
+	parser.add_argument('--epochs', type=int, default=400, help="Number of Training Epochs")
+	parser.add_argument('--alpha', type=float, default=5000, help="alpha weight")
+	parser.add_argument('--beta', type=float, default=100, help="beta weight")
+	parser.add_argument('--gamma', type=float, default=1000, help="gamma weight")
+	parser.add_argument('--delta', type=float, default=0, help="delta weight")
+	parser.add_argument('--lambdap', type=float, default=0, help="lambda weight")
+	parser.add_argument('--recon_lambda', type=float, default=100, help="reconstruction loss weight")
+	parser.add_argument('--kl_lambda', type=float, default=1e-3, help="KL Divergence weight")
+	parser.add_argument('--loss_scaler', type=float, default=-1, help="Scale the whole loss")
+	parser.add_argument('--random_seed', type=int, default=-1, help="Random seed")
+	parser.add_argument('--umap', action='store_true', default=False, help="Make UMAP plot")
+	parser.add_argument('--lr_sched', type=str, default='Plateau', help="LR Scheduler (None/Step/Plateau)")
+
+	args = parser.parse_args()
+
+	params, metrics, metrics_time = main(args)
+	
+	import pandas as pd
+	from datetime import datetime
+	df = pd.DataFrame(columns=[results.keys()])
+
+	for step in range(len(metrics_time)):
+		df.iloc[step] = metrics_time[step]
+
+	print(results)
+	fname = f'results/q-gmm-vgae-{datetime.now().strftime("%d-%m_%H:%M")}.csv'
+	df.write_csv(fname)
+	print('Saved at ' + fname)
