@@ -190,6 +190,6 @@ if __name__ == '__main__':
 		df.iloc[step] = metrics_time[step]
 
 	print(results)
-	fname = f'results/q-fgc-{datetime.now().strftime("%d-%m_%H:%M")}.csv'
+	fname = f'results/q-gcn-{datetime.now().strftime("%d-%m_%H:%M")}.csv'
 	df.write_csv(fname)
 	print('Saved at ' + fname)
