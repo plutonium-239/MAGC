@@ -92,8 +92,8 @@ def conductance(adjacency, clusters):
 def model_eval(adjacency, clusters, labels):
 	accuracy, precision, recall = contingency_metrics(clusters, labels)
 	return {	
-		'Conductance': conductance(adjacency, clusters),
-		'Modularity': modularity(adjacency, clusters),
+		'Conductance': conductance(adjacency, clusters).item(),
+		'Modularity': modularity(adjacency, clusters).item(),
 		'NMI': sklearn.metrics.normalized_mutual_info_score(labels, clusters),
 		'Precision': precision,
 		'Recall': recall,

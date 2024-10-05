@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch_geometric as pyg
 import numpy as np
-
 from tqdm import tqdm
-
 import random
 import os
 import scipy.sparse as sp
@@ -180,10 +178,9 @@ def q_fgc(args, C, X_tilde, theta, B, X):
 	return X_tilde, C, metrics_time, log_vals_time
 
 
-def main(args, experiment):
+def main(args):
 	if args.random_seed == -1:
 		args.random_seed = random.randint(0, 1e5)
-		experiment.log_parameter('random_seed', args.random_seed)
 	X_tilde = sp.random(k, n, density=0.15,random_state=1, data_rvs=temp2.rvs)
 	C = sp.random(p, k, density=0.15, random_state=1, data_rvs=temp2.rvs)
 	X_t_0, C_0, metrics_time, log_vals_time = q_fgc(args, C, X_tilde, theta, B, X)
@@ -217,12 +214,9 @@ if __name__ == '__main__':
 
 	import pandas as pd
 	from datetime import datetime
-	df = pd.DataFrame(columns=[results.keys()])
-
-	for step in range(len(metrics_time)):
-		df.iloc[step] = metrics_time[step]
+	df = pd.DataFrame(metrics_time, columns=list(results.keys())).round(4)
 
 	print(results)
-	fname = f'results/q-fgc-{datetime.now().strftime("%d-%m_%H:%M")}.csv'
-	df.write_csv(fname)
+	fname = f'results/q-fgc-{datetime.now().strftime("%d-%m_%H-%M")}.csv'
+	df.to_csv(fname)
 	print('Saved at ' + fname)

@@ -224,12 +224,9 @@ if __name__ == '__main__':
 	
 	import pandas as pd
 	from datetime import datetime
-	df = pd.DataFrame(columns=[results.keys()])
-
-	for step in range(len(metrics_time)):
-		df.iloc[step] = metrics_time[step]
+	df = pd.DataFrame(metrics_time, columns=list(results.keys())).round(4)
 
 	print(results)
-	fname = f'results/q-gmm-vgae-{datetime.now().strftime("%d-%m_%H:%M")}.csv'
-	df.write_csv(fname)
+	fname = f'results/q-gmm-vgae-{datetime.now().strftime("%d-%m_%H_%M")}.csv'
+	df.to_csv(fname)
 	print('Saved at ' + fname)
